@@ -36,123 +36,50 @@ jobs:
         run: |
           sudo xcode-select -s /Applications/Xcode-${{ inputs.xcode_version }}.app || true
           echo "Using Xcode: $(xcodebuild -version)"
-
-      - name: Create build dirs
-        run: |
-          BUILD_DIR="$PWD/build"
-          rm -rf "$BUILD_DIR"
-          mkdir -p "$BUILD_DIR/ios-device" "$BUILD_DIR/ios-sim" "$BUILD_DIR/xcframework"
-          echo "BUILD_DIR=$BUILD_DIR" > build/dirs.env
         shell: bash
 
-      - name: Build device framework (arm64)
+      - name: Prepare XCFramework artifact
         run: |
-          source build/dirs.env
-          # Adjust scheme/project as appropriate
-          xcodebuild archive \
-            -scheme Tor \
-            -configuration Release \
-            -archivePath "$BUILD_DIR/ios-device/Tor-iphoneos.xcarchive" \
-            -sdk iphoneos \
-            BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
-            SKIP_INSTALL=NO \
-            ENABLE_BITCODE=NO \
-            OTHER_SWIFT_FLAGS="-whole-module-optimization" || (cat /Users/runner/Library/Logs/DiagnosticReports/*.crash || true; exit 1)
-        shell: bash
-
-      - name: Build simulator framework (x86_64/arm64-simulator)
-        run: |
-          source build/dirs.env
-          xcodebuild archive \
-            -scheme Tor \
-            -configuration Release \
-            -archivePath "$BUILD_DIR/ios-sim/Tor-iphonesimulator.xcarchive" \
-            -sdk iphonesimulator \
-            BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
-            SKIP_INSTALL=NO \
-            ENABLE_BITCODE=NO \
-            OTHER_SWIFT_FLAGS="-whole-module-optimization" || (cat /Users/runner/Library/Logs/DiagnosticReports/*.crash || true; exit 1)
-        shell: bash
-
-      - name: Locate frameworks and dSYMs
-        run: |
-          source build/dirs.env
-          ls -R "$BUILD_DIR" || true
-          # Path conventions from xcodebuild archive:
-          DEVICE_FRAMEWORK="$BUILD_DIR/ios-device/Tor-iphoneos.xcarchive/Products/Library/Frameworks/${FRAMEWORK_NAME}.framework"
-          DEVICE_DSYM="$BUILD_DIR/ios-device/Tor-iphoneos.xcarchive/dSYMs/${FRAMEWORK_NAME}.framework.dSYM"
-          SIM_FRAMEWORK="$BUILD_DIR/ios-sim/Tor-iphonesimulator.xcarchive/Products/Library/Frameworks/${FRAMEWORK_NAME}.framework"
-          SIM_DSYM="$BUILD_DIR/ios-sim/Tor-iphonesimulator.xcarchive/dSYMs/${FRAMEWORK_NAME}.framework.dSYM"
-          echo "DEVICE_FRAMEWORK=$DEVICE_FRAMEWORK"
-          echo "DEVICE_DSYM=$DEVICE_DSYM"
-          echo "SIM_FRAMEWORK=$SIM_FRAMEWORK"
-          echo "SIM_DSYM=$SIM_DSYM"
-          test -d "$DEVICE_FRAMEWORK"
-          test -d "$SIM_FRAMEWORK"
-        shell: bash
-
-      - name: Create XCFramework with dSYMs
-        run: |
-          source build/dirs.env
-          DEVICE_FRAMEWORK="$BUILD_DIR/ios-device/Tor-iphoneos.xcarchive/Products/Library/Frameworks/${FRAMEWORK_NAME}.framework"
-          DEVICE_DSYM="$BUILD_DIR/ios-device/Tor-iphoneos.xcarchive/dSYMs/${FRAMEWORK_NAME}.framework.dSYM"
-          SIM_FRAMEWORK="$BUILD_DIR/ios-sim/Tor-iphonesimulator.xcarchive/Products/Library/Frameworks/${FRAMEWORK_NAME}.framework"
-          SIM_DSYM="$BUILD_DIR/ios-sim/Tor-iphonesimulator.xcarchive/dSYMs/${FRAMEWORK_NAME}.framework.dSYM"
-          XCOUT="$PWD/${XCFRAMEWORK_OUT}"
-          rm -rf "$XCOUT"
-          xcodebuild -create-xcframework \
-            -framework "$DEVICE_FRAMEWORK" -debug-symbols "$DEVICE_DSYM" \
-            -framework "$SIM_FRAMEWORK"   -debug-symbols "$SIM_DSYM" \
-            -output "$XCOUT"
-          ls -l "$XCOUT"
-        shell: bash
-
-      - name: Verify dSYM UUIDs (sanity)
-        run: |
-          XC="$PWD/${XCFRAMEWORK_OUT}"
-          # find Tor binary inside XCFramework and its dSYM(s)
-          BIN=$(find "$XC" -type f -path "*/Tor.framework/Tor" | head -n1)
-          DSYM=$(find "$XC" -type d -name "Tor.framework.dSYM" | head -n1)
-          if [ -z "$BIN" ] || [ -z "$DSYM" ]; then
-            echo "Binary or dSYM missing in $XC"
-            ls -R "$XC"
+          set -euo pipefail
+          SRC_XC="Sources/SwiftTor/Tor.xcframework"
+          if [ ! -d "$SRC_XC" ]; then
+            echo "Expected XCFramework not found at $SRC_XC"
+            ls -la "Sources/SwiftTor" || true
             exit 1
           fi
-          echo "Binary: $BIN"
-          echo "DSYM: $DSYM"
-          dwarfdump --uuid "$BIN"
-          dwarfdump --uuid "$DSYM/Contents/Resources/DWARF/Tor" || true
+          echo "Found XCFramework at: $SRC_XC"
+          # Repack as a zip to keep folder structure intact in release asset
+          rm -f Tor.xcframework.zip
+          /usr/bin/ditto -ck --sequesterRsrc --keepParent "$SRC_XC" "Tor.xcframework.zip"
+          echo "Created artifact: Tor.xcframework.zip"
         shell: bash
 
-      - name: Commit XCFramework to branch
+      - name: Optionally commit XCFramework to branch
+        if: ${{ inputs.release_branch != '' }}
         env:
           GIT_AUTHOR_NAME: github-actions
           GIT_AUTHOR_EMAIL: actions@github.com
         run: |
-          # adjust target branch from input
+          set -e
           git config user.name "$GIT_AUTHOR_NAME"
           git config user.email "$GIT_AUTHOR_EMAIL"
-          git checkout -b ${{ inputs.release_branch }} || git checkout ${{ inputs.release_branch }}
-          rm -rf Tor.xcframework || true
-          mv "${{ github.workspace }}/Tor.xcframework" .
-          git add Tor.xcframework
-          git commit -m "Add Tor.xcframework with dSYMs for release ${{ inputs.release_tag }}" || echo "no changes to commit"
-          git push origin HEAD:${{ inputs.release_branch }} --force
+          # Ensure we're on the target branch
+          git checkout -b "${{ inputs.release_branch }}" || git checkout "${{ inputs.release_branch }}"
+          # Sync the XCFramework in repo root for convenience (optional)
+          rm -rf "./Tor.xcframework" || true
+          cp -R "Sources/SwiftTor/Tor.xcframework" "./Tor.xcframework"
+          git add ./Tor.xcframework
+          git commit -m "Sync Tor.xcframework for release ${{ inputs.release_tag }}" || echo "no changes to commit"
+          git push origin HEAD:${{ inputs.release_branch }}
         shell: bash
 
-      - name: Create GitHub release and upload XCFramework
-        uses: softprops/action-gh-release@v1
+      - name: Create GitHub release and upload artifact
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag }}
           name: ${{ inputs.release_tag }}
-          body: "XCFramework built with dSYMs"
+          body: "XCFramework artifact (prebuilt) with dSYMs, packaged from repository."
+          files: |
+            Tor.xcframework.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload XCFramework as release asset
-        uses: actions/upload-release-asset@v1
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./Tor.xcframework
-          asset_name: Tor.xcframework
-          asset_content_type: application/zip
